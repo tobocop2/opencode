@@ -17,7 +17,6 @@ import { normalizeTool, toolOutputText } from "./tool"
 import type {
   FooterApi,
   FooterView,
-  LocalReplayRow,
   MiniPermissionRequest,
   MiniFormRequest,
   RunFilePart,
@@ -42,7 +41,6 @@ type StreamInput = {
   replay?: boolean
   replayLimit?: number
   footer: FooterApi
-  onCommit?: (commit: StreamCommit) => void
   trace?: Trace
   signal?: AbortSignal
   onCatalogRefresh?: (signal?: AbortSignal) => unknown | Promise<unknown>
@@ -58,16 +56,10 @@ export type SessionTurnInput = {
   signal?: AbortSignal
 }
 
-export type SessionResizeReplayInput = {
-  localRows: () => LocalReplayRow[]
-  reset: () => Promise<void>
-}
-
 export type SessionTransport = {
   runPromptTurn(input: SessionTurnInput): Promise<void>
   interruptActiveTurn(): Promise<void>
   selectSubagent(sessionID: string | undefined): void
-  replayOnResize(input: SessionResizeReplayInput): Promise<boolean>
   close(): Promise<void>
   settleForm?(sessionID: string, formID: string): void
 }
@@ -425,18 +417,6 @@ export async function createSessionTransport(input: StreamInput): Promise<Sessio
 
   const write = (commits: StreamCommit[], patch?: { phase?: "idle" | "running"; status?: string; usage?: string }) => {
     if (state.closed || controller.signal.aborted || input.footer.isClosed) return
-    if (!state.initial && state.buffered === undefined)
-      commits.forEach((commit) => {
-        if (!commit.messageID || !commit.partID || (commit.kind !== "assistant" && commit.kind !== "reasoning")) {
-          input.onCommit?.(commit)
-          return
-        }
-        const text = state.fragments.value({ messageID: commit.messageID, partID: commit.partID })
-        input.onCommit?.({
-          ...commit,
-          text: commit.kind === "reasoning" && text ? `Thinking: ${text}` : (text ?? commit.text),
-        })
-      })
     writeSessionOutput(
       { footer: input.footer, trace: input.trace },
       { commits, updates: patch ? [{ type: "stream.patch", patch }] : undefined },
@@ -605,8 +585,7 @@ export async function createSessionTransport(input: StreamInput): Promise<Sessio
             {
               kind: "reasoning",
               source: "reasoning",
-              text:
-                update.previous.length === 0 ? `Thinking: ${item.text}` : item.text.slice(update.previous.length),
+              text: update.previous.length === 0 ? `Thinking: ${item.text}` : item.text.slice(update.previous.length),
               phase: "progress",
               messageID: message.id,
               partID: fragment.partID,
@@ -1288,104 +1267,7 @@ export async function createSessionTransport(input: StreamInput): Promise<Sessio
     }
   }
 
-  const performResizeReplay = async (attempt: Attempt, next: SessionResizeReplayInput) => {
-    if (!input.replay || !state.connected || !current(attempt) || state.closed || input.footer.isClosed) return false
-    const localRows = next.localRows()
-    const buffered: RunV2Event[] = []
-    const replayBuffer = { attempt, events: buffered }
-    let failure: unknown
-    let reset = false
-    state.buffered = replayBuffer
-    try {
-      await input.footer.idle()
-      if (!current(attempt)) return false
-      await next.reset()
-      if (!current(attempt)) return false
-      reset = true
-      state.messageIDs.clear()
-      state.fragments.clear()
-      state.tools.clear()
-      state.toolSources.clear()
-      state.finishedTools.clear()
-      state.skillMessages.clear()
-      state.shellCommands.clear()
-      state.shellStarted.clear()
-      state.shellEnded.clear()
-      state.errors.clear()
-      await hydrate(attempt, { render: true, reuseVisibleWait: false })
-    } catch (error) {
-      failure = error
-    } finally {
-      if (state.buffered === replayBuffer) state.buffered = undefined
-    }
-    if (!current(attempt)) return false
-    try {
-      if (reset) {
-        for (const row of localRows) {
-          if (
-            row.commit.messageID &&
-            row.commit.partID &&
-            (row.commit.kind === "assistant" || row.commit.kind === "reasoning")
-          ) {
-            const prefix = row.commit.kind === "reasoning" ? "Thinking: " : ""
-            const text = row.commit.text.startsWith(prefix) ? row.commit.text.slice(prefix.length) : row.commit.text
-            const restored = state.fragments.restore(
-              { messageID: row.commit.messageID, partID: row.commit.partID },
-              text,
-            )
-            if (restored.type === "covered") continue
-            if (restored.type === "append") {
-              if (restored.suffix)
-                input.footer.append(restored.suffix === text ? row.commit : { ...row.commit, text: restored.suffix })
-              continue
-            }
-          }
-          if (row.commit.kind === "error" && row.commit.messageID) {
-            if (state.errors.has(row.commit.messageID)) continue
-            state.errors.add(row.commit.messageID)
-            input.footer.append(row.commit)
-            continue
-          }
-          if (row.commit.messageID && state.messageIDs.has(row.commit.messageID)) continue
-          input.footer.append(row.commit)
-        }
-      }
-    } finally {
-      for (const event of buffered) apply(attempt, event)
-    }
-    if (reset) await input.footer.idle()
-    if (failure) throw failure
-    return true
-  }
-
-  let resizeReplay: Promise<boolean> | undefined
-  let queuedResizeReplay: SessionResizeReplayInput | undefined
   let closing: Promise<void> | undefined
-
-  const replayOnResize = (next: SessionResizeReplayInput) => {
-    queuedResizeReplay = next
-    if (resizeReplay) return resizeReplay
-    resizeReplay = (async () => {
-      let replayed = false
-      let failure: unknown
-      while (queuedResizeReplay) {
-        const next = queuedResizeReplay
-        queuedResizeReplay = undefined
-        const attempt = activeAttempt
-        if (!attempt || !current(attempt)) continue
-        try {
-          replayed = (await serializeHydration(attempt, () => performResizeReplay(attempt, next))) || replayed
-        } catch (error) {
-          failure ??= error
-        }
-      }
-      if (failure) throw failure
-      return replayed
-    })().finally(() => {
-      resizeReplay = undefined
-    })
-    return resizeReplay
-  }
 
   return {
     async runPromptTurn(next) {
@@ -1486,7 +1368,6 @@ export async function createSessionTransport(input: StreamInput): Promise<Sessio
       else subagents.settleForm(sessionID, formID)
       syncBlockers()
     },
-    replayOnResize,
     close() {
       if (!closing) {
         state.closed = true
@@ -1496,7 +1377,6 @@ export async function createSessionTransport(input: StreamInput): Promise<Sessio
         closing = (async () => {
           await connection.catch(() => {})
           await settleHydration()
-          await resizeReplay?.catch(() => {})
           await settleCatalogRefreshes()
           await subagents.ready()
         })()

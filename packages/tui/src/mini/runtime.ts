@@ -14,7 +14,7 @@ import { loadRunAgents, loadRunCommands, loadRunReferences, waitForDefaultModel 
 import { resolveModelInfo, resolveModelInfoStrict, resolveRunTuiConfig, resolveSessionInfo } from "./runtime.boot"
 import { createRuntimeLifecycle } from "./runtime.lifecycle"
 import { cycleVariant, formatModelLabel, resolveVariant } from "./variant.shared"
-import type { LocalReplayRow, MiniHost, RunInput, RunPrompt, RunProvider, RunTuiConfig, StreamCommit } from "./types"
+import type { MiniHost, RunInput, RunPrompt, RunProvider, RunTuiConfig, StreamCommit } from "./types"
 
 type BootContext = Pick<RunInput, "sdk" | "agent" | "model" | "variant"> & {
   location: LocationRef
@@ -102,7 +102,6 @@ type RuntimeState = {
   activeVariant: string | undefined
   sessionID: string
   history: RunPrompt[]
-  localRows: LocalReplayRow[]
   sessionTitle?: string
   agent: string | undefined
   location: LocationRef
@@ -142,7 +141,6 @@ function formAlreadySettled(error: unknown) {
 }
 
 const RESIZE_DELAY = 250
-const LOCAL_REPLAY_ROW_LIMIT = 100
 
 function abortable<A>(task: Promise<A>, signal: AbortSignal): Promise<A | undefined> {
   if (signal.aborted) return Promise.resolve(undefined)
@@ -194,7 +192,6 @@ async function runInteractiveRuntime(input: RunRuntimeInput, deps: RunRuntimeDep
     activeVariant: resolveVariant(ctx.variant, session.variant, savedVariant, []),
     sessionID: "",
     history: [...session.history],
-    localRows: [],
     agent: ctx.agent,
     location: ctx.location,
   }
@@ -523,23 +520,6 @@ async function runInteractiveRuntime(input: RunRuntimeInput, deps: RunRuntimeDep
     modelLoadStarted = true
     return requestModelLoad()
   })
-  const rememberLocal = (commit: StreamCommit) => {
-    const last = state.localRows.at(-1)
-    if (
-      last &&
-      (commit.kind === "assistant" || commit.kind === "reasoning") &&
-      last.commit.kind === commit.kind &&
-      last.commit.source === commit.source &&
-      last.commit.messageID === commit.messageID &&
-      last.commit.partID === commit.partID &&
-      last.commit.tool === commit.tool
-    ) {
-      state.localRows = [...state.localRows.slice(0, -1), { commit }]
-      return
-    }
-    state.localRows = [...state.localRows, { commit }].slice(-LOCAL_REPLAY_ROW_LIMIT)
-  }
-
   const applyCatalog = (
     catalog: {
       agents: Awaited<ReturnType<typeof loadRunAgents>>
@@ -726,7 +706,6 @@ async function runInteractiveRuntime(input: RunRuntimeInput, deps: RunRuntimeDep
         replay: input.replay,
         replayLimit: input.replayLimit,
         footer,
-        onCommit: rememberLocal,
         trace: log,
         onCatalogRefresh: requestCatalogRefresh,
       })
@@ -747,6 +726,8 @@ async function runInteractiveRuntime(input: RunRuntimeInput, deps: RunRuntimeDep
     return next
   }
 
+  // Committed scrollback is immutable and the terminal owns re-wrapping it, so
+  // resize only refreshes the theme in case the palette changed underneath us.
   let resizeTimer: ReturnType<typeof setTimeout> | undefined
   const offResize = shell.onResize(() => {
     if (resizeTimer) {
@@ -760,23 +741,6 @@ async function runInteractiveRuntime(input: RunRuntimeInput, deps: RunRuntimeDep
       }
 
       shell.refreshTheme()
-      if (!input.replay || !state.stream) {
-        return
-      }
-
-      void state.stream
-        .then((item) =>
-          item.handle.replayOnResize({
-            localRows: () => state.localRows,
-            reset: () =>
-              shell.resetForReplay({
-                sessionTitle: state.sessionTitle,
-                sessionID: state.sessionID,
-                history: state.history,
-              }),
-          }),
-        )
-        .catch(() => {})
     }, RESIZE_DELAY)
   })
 
@@ -801,15 +765,6 @@ async function runInteractiveRuntime(input: RunRuntimeInput, deps: RunRuntimeDep
       onSend: (prompt) => {
         state.shown = true
         state.history.push(prompt)
-        if (prompt.mode !== "shell") {
-          rememberLocal({
-            kind: "user",
-            text: prompt.text,
-            phase: "start",
-            source: "system",
-            messageID: prompt.messageID,
-          })
-        }
       },
       onNewSession: createSession
         ? async () => {
@@ -840,7 +795,6 @@ async function runInteractiveRuntime(input: RunRuntimeInput, deps: RunRuntimeDep
               state.activeVariant = created.variant
               footer.event({ type: "agent", agent: state.agent })
               state.history = []
-              state.localRows = []
               includeFiles = true
               state.demo = input.demo ? await createDemo() : undefined
               log?.write("session.new", {
@@ -886,7 +840,6 @@ async function runInteractiveRuntime(input: RunRuntimeInput, deps: RunRuntimeDep
                 source: "system",
                 messageID: SessionMessage.ID.create(),
               } as const
-              rememberLocal(commit)
               footer.append(commit)
             }
           }
@@ -909,11 +862,6 @@ async function runInteractiveRuntime(input: RunRuntimeInput, deps: RunRuntimeDep
             includeFiles,
             signal,
           })
-          if (prompt.messageID) {
-            state.localRows = state.localRows.filter(
-              (row) => row.commit.kind !== "user" || row.commit.messageID !== prompt.messageID,
-            )
-          }
           // Shell and skill turns never send CLI file attachments; keep them
           // pending for the next prompt-shaped turn.
           if (prompt.mode !== "shell" && prompt.command?.source !== "skill") includeFiles = false
@@ -932,7 +880,6 @@ async function runInteractiveRuntime(input: RunRuntimeInput, deps: RunRuntimeDep
             source: "system",
             messageID: prompt.messageID,
           } as const
-          rememberLocal(commit)
           footer.append(commit)
         }
       },

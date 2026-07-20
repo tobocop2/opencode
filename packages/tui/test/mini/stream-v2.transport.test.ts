@@ -1013,13 +1013,6 @@ describe("V2 mini transport", () => {
         delta: " replacement",
       },
     })
-    let resized = false
-    const resize = transport.replayOnResize({
-      localRows: () => [],
-      reset: async () => {
-        resized = true
-      },
-    })
     releaseHydration()
     while (
       !ui.events.some(
@@ -1028,8 +1021,6 @@ describe("V2 mini transport", () => {
     )
       await Bun.sleep(0)
     while (refreshes < 2) await Bun.sleep(0)
-    await resize
-    expect(resized).toBe(false)
     await expect(
       transport.runPromptTurn({
         agent: undefined,
@@ -1090,336 +1081,6 @@ describe("V2 mini transport", () => {
     await transport.close()
   })
 
-  test("reconciles buffered deltas already present in a resize snapshot", async () => {
-    const events = feed()
-    events.push(connected())
-    const client = sdk({ streams: [events] })
-    const ui = footer()
-    const transport = await createSessionTransport({
-      sdk: client,
-      sessionID: "ses_1",
-      thinking: false,
-      replay: true,
-      footer: ui.api,
-    })
-    spyOn(client.message, "list").mockImplementation(() =>
-      ok({
-        data: [
-          {
-            id: "msg_assistant",
-            type: "assistant",
-            agent: "build",
-            model: { providerID: "test", id: "model" },
-            content: [{ type: "text", text: "the answer" }],
-            time: { created: 2, completed: 3 },
-          },
-        ],
-        cursor: {},
-      }),
-    )
-    let reset!: () => void
-    const resetting = new Promise<void>((resolve) => {
-      reset = resolve
-    })
-    const replay = transport.replayOnResize({ localRows: () => [], reset: () => resetting })
-    events.push({
-      id: "evt_text_started",
-      created: 0,
-      type: "session.text.started",
-      durable: durable("ses_1"),
-      data: {
-        sessionID: "ses_1",
-        assistantMessageID: "msg_assistant",
-        ordinal: 0,
-      },
-    })
-    events.push({
-      id: "evt_text",
-      created: 0,
-      type: "session.text.delta",
-      data: {
-        sessionID: "ses_1",
-        assistantMessageID: "msg_assistant",
-        ordinal: 0,
-        delta: "answer",
-      },
-    })
-    await Bun.sleep(0)
-    reset()
-    await replay
-
-    expect(ui.commits.filter((item) => item.text === "the answer")).toHaveLength(1)
-    expect(ui.commits.some((item) => item.text === "answer")).toBe(false)
-    await transport.close()
-  })
-
-  test("replays live assistant text missing from the resize projection", async () => {
-    const events = feed()
-    events.push(connected())
-    const client = sdk({ streams: [events] })
-    spyOn(client.message, "list").mockImplementation(() =>
-      ok({
-        data: [
-          {
-            id: "msg_assistant",
-            type: "assistant",
-            agent: "build",
-            model: { providerID: "test", id: "model" },
-            content: [{ type: "text", text: "partial" }],
-            time: { created: 2, completed: 3 },
-          },
-        ],
-        cursor: {},
-      }),
-    )
-    const ui = footer()
-    const live: StreamCommit[] = []
-    const transport = await createSessionTransport({
-      sdk: client,
-      sessionID: "ses_1",
-      thinking: false,
-      replay: true,
-      footer: ui.api,
-      onCommit: (commit) => live.push(commit),
-    })
-    events.push({
-      id: "evt_text",
-      created: 0,
-      type: "session.text.delta",
-      data: {
-        sessionID: "ses_1",
-        assistantMessageID: "msg_assistant",
-        ordinal: 0,
-        delta: " suffix",
-      },
-    })
-    await Bun.sleep(0)
-    expect(live.map((commit) => commit.text)).toEqual(["partial suffix"])
-
-    await transport.replayOnResize({
-      localRows: () => [
-        { commit: live[0]! },
-        {
-          commit: {
-            ...live[0]!,
-            partID: "text:1",
-            text: "entirely local",
-          },
-        },
-      ],
-      reset: async () => {},
-    })
-
-    expect(ui.commits.filter((commit) => commit.messageID === "msg_assistant").map((commit) => commit.text)).toEqual([
-      "partial",
-      " suffix",
-      "partial",
-      " suffix",
-      "entirely local",
-    ])
-    await transport.close()
-  })
-
-  test("does not replay a resize-buffered suffix twice", async () => {
-    const events = feed()
-    events.push(connected())
-    const client = sdk({ streams: [events] })
-    spyOn(client.message, "list").mockImplementation(() =>
-      ok({
-        data: [
-          {
-            id: "msg_assistant",
-            type: "assistant",
-            agent: "build",
-            model: { providerID: "test", id: "model" },
-            content: [{ type: "text", text: "partial" }],
-            time: { created: 2, completed: 3 },
-          },
-        ],
-        cursor: {},
-      }),
-    )
-    const ui = footer()
-    const live: StreamCommit[] = []
-    const transport = await createSessionTransport({
-      sdk: client,
-      sessionID: "ses_1",
-      thinking: false,
-      replay: true,
-      footer: ui.api,
-      onCommit: (commit) => live.push(commit),
-    })
-    let reset!: () => void
-    const resetting = new Promise<void>((resolve) => {
-      reset = resolve
-    })
-    const replay = transport.replayOnResize({
-      localRows: () => live.map((commit) => ({ commit })),
-      reset: () => resetting,
-    })
-    events.push({
-      id: "evt_text",
-      created: 0,
-      type: "session.text.delta",
-      data: {
-        sessionID: "ses_1",
-        assistantMessageID: "msg_assistant",
-        ordinal: 0,
-        delta: " suffix",
-      },
-    })
-    await Bun.sleep(0)
-    reset()
-    await replay
-
-    expect(ui.commits.filter((commit) => commit.messageID === "msg_assistant").map((commit) => commit.text)).toEqual([
-      "partial",
-      "partial",
-      " suffix",
-    ])
-    expect(live.map((commit) => commit.text)).toEqual(["partial suffix"])
-    await transport.close()
-  })
-
-  test("preserves active text and reasoning across resize before terminal projection", async () => {
-    const events = feed()
-    events.push(connected())
-    const client = sdk({ streams: [events] })
-    spyOn(client.message, "list").mockImplementation(() => ok({ data: [], cursor: {} }))
-    const ui = footer()
-    const live: StreamCommit[] = []
-    const transport = await createSessionTransport({
-      sdk: client,
-      sessionID: "ses_1",
-      thinking: true,
-      replay: true,
-      footer: ui.api,
-      onCommit: (commit) => live.push(commit),
-    })
-    events.push({
-      id: "evt_text",
-      created: 0,
-      type: "session.text.delta",
-      data: {
-        sessionID: "ses_1",
-        assistantMessageID: "msg_assistant",
-        ordinal: 0,
-        delta: "hello",
-      },
-    })
-    events.push({
-      id: "evt_reasoning",
-      created: 0,
-      type: "session.reasoning.delta",
-      data: {
-        sessionID: "ses_1",
-        assistantMessageID: "msg_assistant",
-        ordinal: 0,
-        delta: "thought",
-      },
-    })
-    await Bun.sleep(0)
-    expect(live.map((commit) => commit.text)).toEqual(["hello", "Thinking: thought"])
-
-    await transport.replayOnResize({
-      localRows: () => live.map((commit) => ({ commit })),
-      reset: async () => {},
-    })
-
-    expect(ui.commits.slice(-2).map((commit) => commit.text)).toEqual(["hello", "Thinking: thought"])
-    await transport.close()
-  })
-
-  test("serializes and coalesces overlapping resize replays", async () => {
-    const events = feed()
-    events.push(connected())
-    const client = sdk({ streams: [events] })
-    const ui = footer()
-    const transport = await createSessionTransport({
-      sdk: client,
-      sessionID: "ses_1",
-      thinking: false,
-      replay: true,
-      footer: ui.api,
-    })
-    let release!: () => void
-    const blocked = new Promise<void>((resolve) => {
-      release = resolve
-    })
-    const order: string[] = []
-    const first = transport.replayOnResize({
-      localRows: () => [],
-      reset: async () => {
-        order.push("first:start")
-        await blocked
-        order.push("first:end")
-      },
-    })
-    await Bun.sleep(0)
-    const second = transport.replayOnResize({
-      localRows: () => [],
-      reset: async () => {
-        order.push("second")
-      },
-    })
-    release()
-    await Promise.all([first, second])
-
-    expect(second).toBe(first)
-    expect(order).toEqual(["first:start", "first:end", "second"])
-    await transport.close()
-  })
-
-  test("restores local output and drains buffered events when resize hydration fails", async () => {
-    const events = feed()
-    events.push(connected())
-    const client = sdk({ streams: [events] })
-    const ui = footer()
-    const live: StreamCommit[] = []
-    const transport = await createSessionTransport({
-      sdk: client,
-      sessionID: "ses_1",
-      thinking: false,
-      replay: true,
-      footer: ui.api,
-      onCommit: (commit) => live.push(commit),
-    })
-    events.push({
-      id: "evt_text_1",
-      created: 0,
-      type: "session.text.delta",
-      data: {
-        sessionID: "ses_1",
-        assistantMessageID: "msg_assistant",
-        ordinal: 0,
-        delta: "hello",
-      },
-    })
-    await Bun.sleep(0)
-    spyOn(client.message, "list").mockImplementation(() => Promise.reject(new Error("projection failed")))
-
-    const replay = transport.replayOnResize({
-      localRows: () => live.map((commit) => ({ commit })),
-      reset: async () => {},
-    })
-    events.push({
-      id: "evt_text_2",
-      created: 0,
-      type: "session.text.delta",
-      data: {
-        sessionID: "ses_1",
-        assistantMessageID: "msg_assistant",
-        ordinal: 0,
-        delta: " world",
-      },
-    })
-    await expect(replay).rejects.toThrow("projection failed")
-
-    expect(ui.commits.slice(-2).map((commit) => commit.text)).toEqual(["hello", " world"])
-    expect(live.at(-1)?.text).toBe("hello world")
-    await transport.close()
-  })
-
   test("dedupes a projected step failure from live redelivery", async () => {
     const events = feed()
     events.push(connected())
@@ -1462,106 +1123,6 @@ describe("V2 mini transport", () => {
     await Bun.sleep(0)
 
     expect(ui.commits.filter((commit) => commit.kind === "error" && commit.text === "provider failed")).toHaveLength(1)
-    await transport.close()
-  })
-
-  test("dedupes a retained live step failure from resize projection", async () => {
-    const events = feed()
-    events.push(connected())
-    const client = sdk({ streams: [events] })
-    const ui = footer()
-    const live: StreamCommit[] = []
-    const transport = await createSessionTransport({
-      sdk: client,
-      sessionID: "ses_1",
-      thinking: false,
-      replay: true,
-      footer: ui.api,
-      onCommit: (commit) => live.push(commit),
-    })
-    events.push({
-      id: "evt_step_failed",
-      created: 2,
-      type: "session.step.failed",
-      durable: durable("ses_1", 1),
-      data: {
-        sessionID: "ses_1",
-        assistantMessageID: "msg_assistant",
-        error: { type: "provider.transport", message: "provider failed" },
-      },
-    })
-    await Bun.sleep(0)
-    expect(live[0]?.messageID).toBe("msg_assistant")
-    spyOn(client.message, "list").mockImplementation(() =>
-      ok({
-        data: [
-          {
-            id: "msg_assistant",
-            type: "assistant",
-            agent: "build",
-            model: { providerID: "test", id: "model" },
-            content: [],
-            error: { type: "provider.transport", message: "provider failed" },
-            time: { created: 2, completed: 3 },
-          },
-        ],
-        cursor: {},
-      }),
-    )
-
-    await transport.replayOnResize({
-      localRows: () => live.map((commit) => ({ commit })),
-      reset: async () => {},
-    })
-
-    expect(ui.commits.filter((commit) => commit.kind === "error" && commit.text === "provider failed")).toHaveLength(2)
-    await transport.close()
-  })
-
-  test("preserves an execution-only local error beside its projected prompt", async () => {
-    const events = feed()
-    events.push(connected())
-    const client = sdk({ streams: [events] })
-    const ui = footer()
-    const transport = await createSessionTransport({
-      sdk: client,
-      sessionID: "ses_1",
-      thinking: false,
-      replay: true,
-      footer: ui.api,
-    })
-    spyOn(client.message, "list").mockImplementation(() =>
-      ok({
-        data: [
-          {
-            id: "msg_prompt",
-            type: "user",
-            text: "hello",
-            files: [],
-            agents: [],
-            time: { created: 2 },
-          },
-        ],
-        cursor: {},
-      }),
-    )
-
-    await transport.replayOnResize({
-      localRows: () => [
-        {
-          commit: {
-            kind: "error",
-            source: "system",
-            text: "model unavailable",
-            phase: "start",
-            messageID: "msg_prompt",
-          },
-        },
-      ],
-      reset: async () => {},
-    })
-
-    expect(ui.commits.some((commit) => commit.kind === "error" && commit.text === "model unavailable")).toBe(true)
     await transport.close()
   })
 
@@ -2401,9 +1962,7 @@ describe("V2 mini transport", () => {
         ],
         command: { name: "deploy", arguments: "prod" },
       },
-      files: [
-        { type: "file", url: "file:///tmp/context.txt", filename: "context.txt", mime: "text/plain" },
-      ],
+      files: [{ type: "file", url: "file:///tmp/context.txt", filename: "context.txt", mime: "text/plain" }],
       includeFiles: true,
     })
 
@@ -2913,7 +2472,11 @@ describe("V2 mini transport", () => {
       { sessionID: "ses_child", label: "Explore", title: "Find files", status: "running" },
     ])
 
-    expect(states().at(-1)?.details.ses_child?.commits.filter((item) => item.text === "child answer")).toHaveLength(1)
+    expect(
+      states()
+        .at(-1)
+        ?.details.ses_child?.commits.filter((item) => item.text === "child answer"),
+    ).toHaveLength(1)
 
     events.push({
       id: "evt_child_text_replayed",
@@ -2927,7 +2490,11 @@ describe("V2 mini transport", () => {
       },
     })
     await Bun.sleep(0)
-    expect(states().at(-1)?.details.ses_child?.commits.filter((item) => item.text === "child answer")).toHaveLength(1)
+    expect(
+      states()
+        .at(-1)
+        ?.details.ses_child?.commits.filter((item) => item.text === "child answer"),
+    ).toHaveLength(1)
 
     events.push({
       id: "evt_child_text_suffix",
@@ -2940,7 +2507,9 @@ describe("V2 mini transport", () => {
         delta: " suffix",
       },
     })
-    while (!states().some((state) => state.details.ses_child?.commits.some((item) => item.text === "child answer suffix")))
+    while (
+      !states().some((state) => state.details.ses_child?.commits.some((item) => item.text === "child answer suffix"))
+    )
       await Bun.sleep(0)
 
     events.push({

@@ -96,7 +96,6 @@ describe("run interactive runtime", () => {
               interruptActiveTurn: async () => {},
               selectSubagent: () => {},
               settleForm: (sessionID: string, formID: string) => settled.push({ sessionID, formID }),
-              replayOnResize: async () => false,
               close: async () => {},
             }
           },
@@ -434,7 +433,6 @@ describe("run interactive runtime", () => {
               runPromptTurn: async () => {},
               interruptActiveTurn: async () => {},
               selectSubagent: () => {},
-              replayOnResize: async () => false,
               close: async () => {},
             }
           },

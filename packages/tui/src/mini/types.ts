@@ -428,10 +428,6 @@ export type StreamCommit = {
   }
 }
 
-export type LocalReplayRow = {
-  commit: StreamCommit
-}
-
 // The public contract between the stream transport / prompt queue and
 // the footer. RunFooter implements this. The transport and queue never
 // touch the renderer directly -- they go through this interface.

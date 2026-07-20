@@ -32,6 +32,7 @@ type ActiveEntry = {
   committedBlocks: number
   pendingSpacerRows: number
   rendered: boolean
+  width: number
 }
 
 function commitMarkdownBlocks(input: {
@@ -192,7 +193,27 @@ export class RunScrollbackStream {
       committedBlocks: 0,
       pendingSpacerRows: rows || (!this.rendered && this.wrote ? 1 : 0),
       rendered: false,
+      width: this.renderer.width,
     }
+  }
+
+  // Text and code entries commit by layout row, and committed rows are frozen
+  // in terminal scrollback at the width they were rendered with. Narrowing
+  // re-wraps the content into more rows, so the next flush re-emits only the
+  // wrap seam. Widening re-wraps it into fewer rows, which would skip content,
+  // so restart the entry in a fresh surface instead; rows already committed
+  // stay untouched. Markdown entries commit by block index and are unaffected.
+  private restartActive(active: ActiveEntry): ActiveEntry {
+    const next = this.createEntry(active.commit, active.body)
+    next.content = active.content
+    next.pendingSpacerRows = active.pendingSpacerRows
+    next.rendered = active.rendered
+    if (!active.surface.isDestroyed) {
+      active.surface.destroy()
+    }
+
+    this.active = next
+    return next
   }
 
   private markRendered(commit: StreamCommit | undefined): void {
@@ -218,10 +239,13 @@ export class RunScrollbackStream {
   }
 
   private async flushActive(done: boolean, trailingNewline: boolean): Promise<boolean> {
-    const active = this.active
-    if (!active) {
+    const current = this.active
+    if (!current) {
       return false
     }
+
+    const active =
+      current.committedRows > 0 && this.renderer.width > current.width ? this.restartActive(current) : current
 
     if (active.body.type === "text") {
       if (!(active.renderable instanceof TextRenderable)) {
@@ -243,6 +267,7 @@ export class RunScrollbackStream {
       })
       active.committedRows = targetRows
       active.rendered = true
+      active.width = this.renderer.width
       return true
     }
 
@@ -267,6 +292,7 @@ export class RunScrollbackStream {
       })
       active.committedRows = targetRows
       active.rendered = true
+      active.width = this.renderer.width
       return true
     }
 
@@ -307,22 +333,22 @@ export class RunScrollbackStream {
       return undefined
     }
 
-    const active = this.active
+    // flushActive can swap this.active into a fresh surface after a widening
+    // resize, so re-read it instead of trusting a pre-flush capture.
+    let finished: ActiveEntry | undefined
 
     try {
       await this.flushActive(true, trailingNewline)
     } finally {
-      if (this.active === active) {
-        this.active = undefined
-      }
-
-      if (!active.surface.isDestroyed) {
-        active.surface.destroy()
+      finished = this.active
+      this.active = undefined
+      if (finished && !finished.surface.isDestroyed) {
+        finished.surface.destroy()
       }
       this.releasePendingThemes()
     }
 
-    return active.rendered ? active.commit : undefined
+    return finished?.rendered ? finished.commit : undefined
   }
 
   private async writeStreaming(commit: StreamCommit, body: ActiveBody): Promise<void> {
